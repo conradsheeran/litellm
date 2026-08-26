@@ -213,6 +213,20 @@ jobs:
           echo "amd64 digest: ${amd64_digest}"
           echo "amd64_digest=${amd64_digest}" >> "$GITHUB_ENV"
 
+      - name: Verify linux/amd64 image imports MCP server and pattern counts
+        run: |
+          # Pull the amd64 child into the local docker daemon and inspect the
+          # installed source: the MCP server module must import and the two
+          # routing parse sites must carry the patched exception handler.
+          docker run --rm \
+            --entrypoint python \
+            "${TARGET_REGISTRY}/${IMAGE_NAME}@${amd64_digest}" -c \
+            "import litellm.proxy._experimental.mcp_server.server as s; print('MCP server import OK')"
+          docker run --rm \
+            --entrypoint python \
+            "${TARGET_REGISTRY}/${IMAGE_NAME}@${amd64_digest}" -c \
+            "import pathlib, litellm; p = pathlib.Path(litellm.__file__).parent / 'proxy/_experimental/mcp_server/server.py'; t = p.read_text(); old = t.count('except (json.JSONDecodeError, TypeError)'); patched = t.count('except (json.JSONDecodeError, UnicodeDecodeError, TypeError)'); assert old == 0, f'old pattern count {old}'; assert patched == 2, f'patched pattern count {patched}'; print(f'pattern counts: old={old} patched={patched}')"
+
       - name: Report top-level digest
         run: |
           index_digest=$(skopeo digest "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}")
@@ -230,6 +244,7 @@ jobs:
             python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),indent=2))" >> "$GITHUB_STEP_SUMMARY" || \
             echo "Tag listing unavailable" >> "$GITHUB_STEP_SUMMARY"
           echo "index_digest=${index_digest}" >> "$GITHUB_ENV"
+
 
       - name: Verify no extra tags were published
         run: |
