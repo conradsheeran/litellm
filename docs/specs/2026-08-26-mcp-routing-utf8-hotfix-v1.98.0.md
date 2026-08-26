@@ -283,14 +283,13 @@ The workflow must stop before publication if any gate fails.
 
 Use `docker/Dockerfile.database` with repository root as build context.
 
-Publish a multi-platform OCI image matching the upstream v1.98.0 platform set:
+Publish an OCI image for the deployment platform set. The hotfix production target is linux/amd64 only:
 
 ```text
 linux/amd64
-linux/arm64
 ```
 
-Use Buildx/QEMU and pin all GitHub Actions dependencies to full commit SHAs, consistent with the repository's existing workflow security style.
+A later hotfix revision may add linux/arm64 if the production fleet requires it. Buildx is required and all GitHub Actions dependencies must be pinned to full commit SHAs, consistent with the repository's existing workflow security style.
 
 The only allowed push target is:
 
@@ -325,7 +324,7 @@ It must not create a GitHub release, publish a Python package, update a Helm cha
 
 ### 8.6 Post-publication verification
 
-After push, the workflow must inspect the published manifest and fail if the tagged OCI index does not contain both `linux/amd64` and `linux/arm64` image manifests.
+After push, the workflow must inspect the published manifest and fail if the tagged OCI index does not contain a `linux/amd64` image manifest.
 
 The workflow must also:
 
