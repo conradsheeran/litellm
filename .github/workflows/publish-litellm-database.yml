@@ -1,0 +1,246 @@
+# Publish the fork-only litellm-database image for the MCP routing UTF-8 hotfix.
+#
+# Trigger: push of the fork-only source tag v1.98.0-mcp-utf8.1.
+# Repository guard: runs only when github.repository == 'conradsheeran/litellm'.
+# Dry-run (workflow_dispatch): builds without pushing; push: false forced.
+#
+# See docs/specs/2026-08-26-mcp-routing-utf8-hotfix-v1.98.0.md §8.
+
+name: Publish litellm-database (fork hotfix)
+
+on:
+  push:
+    tags:
+      - v1.98.0-mcp-utf8.1
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Dry-run (build only, no push)"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: litellm-database
+  IMAGE_TAG: v1.98.0
+  TARGET_REGISTRY: ghcr.io/conradsheeran
+  EXPECTED_BASELINE_TAG: v1.98.0
+  EXPECTED_BASELINE_COMMIT: d8f71d7bdbd7c9873d98293f83d64c6db72847e6
+  PATCH_RELEASE_TAG: v1.98.0-mcp-utf8.1
+  OLD_PATTERN: "except (json.JSONDecodeError, TypeError)"
+  PATCHED_PATTERN: "except (json.JSONDecodeError, UnicodeDecodeError, TypeError)"
+
+jobs:
+  gates:
+    name: Pre-publication gates
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.check-all.outputs.passed }}
+    steps:
+      - name: Repository guard
+        if: github.repository != 'conradsheeran/litellm'
+        run: |
+          echo "::error::This workflow runs only on conradsheeran/litellm"
+          exit 1
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify baseline tag resolves to expected commit
+        run: |
+          actual=$(git rev-parse "${EXPECTED_BASELINE_TAG}^{commit}")
+          if [ "$actual" != "$EXPECTED_BASELINE_COMMIT" ]; then
+            echo "::error::${EXPECTED_BASELINE_TAG} resolves to ${actual}, expected ${EXPECTED_BASELINE_COMMIT}"
+            exit 1
+          fi
+          echo "Baseline verified: ${EXPECTED_BASELINE_TAG} @ ${actual}"
+
+      - name: Verify current commit is tagged and descends from baseline
+        run: |
+          actual_tag=$(git describe --exact-match --tags HEAD 2>/dev/null || true)
+          if [ "$actual_tag" != "$PATCH_RELEASE_TAG" ]; then
+            echo "::error::HEAD is tagged ${actual_tag}, expected ${PATCH_RELEASE_TAG}"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${EXPECTED_BASELINE_TAG}" HEAD; then
+            echo "::error::HEAD does not descend from ${EXPECTED_BASELINE_TAG}"
+            exit 1
+          fi
+          echo "Tag verified: ${PATCH_RELEASE_TAG} descends from ${EXPECTED_BASELINE_TAG}"
+
+      - name: Verify exception pattern counts in server.py
+        run: |
+          old=$(grep -cF "${OLD_PATTERN}" litellm/proxy/_experimental/mcp_server/server.py || true)
+          patched=$(grep -cF "${PATCHED_PATTERN}" litellm/proxy/_experimental/mcp_server/server.py || true)
+          if [ "$old" -ne 0 ]; then
+            echo "::error::Found ${old} old pattern(s), expected 0"
+            exit 1
+          fi
+          if [ "$patched" -ne 2 ]; then
+            echo "::error::Found ${patched} patched pattern(s), expected 2"
+            exit 1
+          fi
+          echo "Pattern counts: old=${old}, patched=${patched}"
+
+      - name: Verify changed-file set from baseline
+        run: |
+          changes=$(git diff --name-only "${EXPECTED_BASELINE_TAG}" HEAD | sort)
+          expected=$(printf '%s\n' \
+            ".github/workflows/publish-litellm-database.yml" \
+            "docs/specs/2026-08-26-mcp-routing-utf8-hotfix-v1.98.0.md" \
+            "litellm/proxy/_experimental/mcp_server/server.py" \
+            "tests/test_litellm/proxy/_experimental/mcp_server/test_mcp_server.py" | sort)
+          if [ "$changes" != "$expected" ]; then
+            echo "::error::Changed files differ from expected set"
+            diff <(echo "$expected") <(echo "$changes")
+            exit 1
+          fi
+          echo "Changed-file set verified"
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@6b9c6063abd6010835654ebf7a6e39f5448ee59b # v5.3.0
+        with:
+          version: "0.10.9"
+
+      - name: Run focused regression test
+        run: |
+          uv run --group dev --group proxy-dev --extra proxy \
+            pytest tests/test_litellm/proxy/_experimental/mcp_server/test_mcp_server.py \
+            -k multibyte_char_split_at_cap -q
+
+      - name: Run full mapped MCP test file
+        run: |
+          uv run --group dev --group proxy-dev --extra proxy \
+            pytest tests/test_litellm/proxy/_experimental/mcp_server/test_mcp_server.py -q
+
+      - name: Run Ruff check
+        run: |
+          uv run ruff check \
+            litellm/proxy/_experimental/mcp_server/server.py \
+            tests/test_litellm/proxy/_experimental/mcp_server/test_mcp_server.py
+
+      - name: Run Ruff format check
+        run: |
+          uv run ruff format --check \
+            litellm/proxy/_experimental/mcp_server/server.py \
+            tests/test_litellm/proxy/_experimental/mcp_server/test_mcp_server.py
+
+      - name: Mark gates passed
+        id: check-all
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  build-and-publish:
+    name: Build and publish
+    needs: gates
+    if: needs.gates.outputs.passed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6beac0c592f9e5e1fb5b1e01d5f0 # v3.10.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@4574d27a4764455b42196d70a065bc6853246a25 # v3.4.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for existing tag (fail if already published)
+        run: |
+          manifest=$(skopeo inspect --raw "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" 2>/dev/null || true)
+          if [ -n "$manifest" ]; then
+            echo "::error::Image ${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} already exists — refusing to overwrite"
+            exit 1
+          fi
+          echo "Tag does not exist; proceeding"
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        id: build
+        with:
+          context: .
+          file: docker/Dockerfile.database
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push != false }}
+          provenance: true
+          sbom: true
+          tags: ${{ env.TARGET_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.IMAGE_TAG }}
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.description=LiteLLM v1.98.0 database image with MCP routing UTF-8 hotfix
+
+      - name: Verify published OCI index
+        run: |
+          index=$(skopeo inspect --raw "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}")
+          manifest_count=$(echo "$index" | python3 -c "import sys,json; m=json.load(sys.stdin); print(len(m.get('manifests',[])))")
+          if [ "$manifest_count" -lt 2 ]; then
+            echo "::error::Expected at least 2 platform manifests, got ${manifest_count}"
+            exit 1
+          fi
+          echo "OCI index contains ${manifest_count} manifests"
+
+      - name: Verify linux/amd64 child manifest
+        run: |
+          amd64_digest=$(skopeo inspect --raw "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" | \
+            python3 -c "import sys,json; m=json.load(sys.stdin); [print(x['digest']) for x in m.get('manifests',[]) if 'linux' in x['platform'].get('os','') and 'amd64' in x['platform'].get('architecture','')]")
+          if [ -z "$amd64_digest" ]; then
+            echo "::error::linux/amd64 manifest not found"
+            exit 1
+          fi
+          echo "amd64 digest: ${amd64_digest}"
+          echo "amd64_digest=${amd64_digest}" >> "$GITHUB_ENV"
+
+      - name: Report top-level digest
+        run: |
+          index_digest=$(skopeo digest "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}")
+          echo "## Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}@${index_digest}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Source" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: ${PATCH_RELEASE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Index manifests" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          skopeo list-tags "docker://${TARGET_REGISTRY}/${IMAGE_NAME}" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),indent=2))" >> "$GITHUB_STEP_SUMMARY" || \
+            echo "Tag listing unavailable" >> "$GITHUB_STEP_SUMMARY"
+          echo "index_digest=${index_digest}" >> "$GITHUB_ENV"
+
+      - name: Verify no extra tags were published
+        run: |
+          tags=$(skopeo list-tags "docker://${TARGET_REGISTRY}/${IMAGE_NAME}" 2>/dev/null | \
+            python3 -c "import sys,json; tags=json.load(sys.stdin).get('RepositoryTags',[]); print(' '.join(tags))" 2>/dev/null || true)
+          if [ -n "$tags" ]; then
+            expected="${IMAGE_TAG}"
+            for t in $tags; do
+              if [ "$t" != "$expected" ]; then
+                echo "::warning::Unexpected tag '${t}' found in repository"
+              fi
+            done
+          fi
+          echo "Tags: ${tags:-none}"

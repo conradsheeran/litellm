@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import json
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1806,6 +1807,114 @@ async def test_mcp_routing_caps_body_peek_for_oversized_chunked_body():
     total_streamed = sum(len(b) for b in stateless_received_chunks)
     assert total_streamed == len(first_chunk) + sum(len(b) for b in oversized_tail)
 
+@pytest.mark.asyncio
+async def test_mcp_routing_peek_survives_multibyte_char_split_at_cap():
+    """
+    A valid large UTF-8 JSON-RPC body whose 4096-byte routing peek ends in
+    the middle of a multibyte code point must not crash the routing peek.
+
+    The peek is a raw byte prefix. If byte 4096 cuts a multibyte UTF-8 code
+    point, ``json.loads(peeked_bytes)`` raises ``UnicodeDecodeError`` before
+    the complete body reaches normal downstream handling. Both routing parse
+    sites (``_is_initialize_request`` and the JSON-RPC response check in
+    ``handle_streamable_http_mcp``) must treat that like the already-handled
+    incomplete-JSON case and fall back to the existing truncated-body paths.
+    """
+    try:
+        from litellm.proxy._experimental.mcp_server import server as mcp_server
+        from litellm.proxy._experimental.mcp_server.server import (
+            handle_streamable_http_mcp,
+            session_manager_stateful,
+            session_manager_stateless,
+        )
+    except ImportError:
+        pytest.skip("MCP server not available")
+
+    peek_cap = mcp_server._MCP_ROUTING_PEEK_MAX_BYTES
+    prefix = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"progress_test","arguments":{"text":"'
+    suffix = b'"}}}'
+    padding = b"x" * (peek_cap - len(prefix) - 1)
+    body = prefix + padding + "\u00e9".encode() + suffix
+
+    # Self-check the payload preconditions: complete valid UTF-8 JSON whose
+    # truncated peek prefix cuts the two-byte \u00e9 in half.
+    assert len(body) > peek_cap
+    assert json.loads(body)["method"] == "tools/call"
+    with pytest.raises(UnicodeDecodeError):
+        body[:peek_cap].decode("utf-8")
+
+    messages = [
+        {"type": "http.request", "body": body, "more_body": False},
+    ]
+    receive_calls = {"count": 0}
+
+    async def receive():
+        idx = receive_calls["count"]
+        receive_calls["count"] += 1
+        if idx < len(messages):
+            return messages[idx]
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp/progress_test",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer test-key"),
+        ],
+    }
+    send = AsyncMock()
+
+    stateless_received_chunks = []
+    stateless_calls = {"count": 0}
+
+    async def stateless_handle(s, r, se):
+        stateless_calls["count"] += 1
+        # Drain the wrapped receive the same way the SDK would and capture
+        # every byte so the replay can be compared to the original body.
+        while True:
+            msg = await r()
+            if msg.get("type") != "http.request":
+                break
+            stateless_received_chunks.append(msg.get("body", b"") or b"")
+            if not msg.get("more_body", False):
+                break
+
+    async def stateful_handle(s, r, se):
+        raise AssertionError("non-initialize POST should not reach stateful manager")
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.server.extract_mcp_auth_context",
+            new_callable=AsyncMock,
+            return_value=(MagicMock(), None, ["progress_test"], None, None, None),
+        ),
+        patch("litellm.proxy._experimental.mcp_server.server.set_auth_context"),
+        patch(
+            "litellm.proxy._experimental.mcp_server.server._SESSION_MANAGERS_INITIALIZED",
+            True,
+        ),
+        patch.object(session_manager_stateless, "handle_request", side_effect=stateless_handle),
+        patch.object(session_manager_stateful, "handle_request", side_effect=stateful_handle),
+        patch.object(session_manager_stateless, "_server_instances", {}),
+        patch.object(session_manager_stateful, "_server_instances", {}),
+    ):
+        await handle_streamable_http_mcp(scope, receive, send)
+
+    # The routing peek must not raise UnicodeDecodeError (it escapes as an
+    # internal HTTP 500 before the body ever reaches a session manager).
+    assert stateless_calls["count"] == 1
+    # The stateful manager must not see this no-session non-initialize call.
+    # The bytes the downstream handler reconstructs must equal the original
+    # complete request body byte for byte.
+    assert b"".join(stateless_received_chunks) == body
+    # LiteLLM must not have emitted a 500 response start.
+    assert not any(
+        call.args[0].get("type") == "http.response.start"
+        and call.args[0].get("status", 0) >= 500
+        for call in send.call_args_list
+    )
 
 @pytest.mark.asyncio
 async def test_enforce_stateful_session_cap_evicts_oldest_idle_then_rejects():
