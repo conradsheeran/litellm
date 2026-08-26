@@ -2,7 +2,7 @@
 #
 # Trigger: push of the fork-only source tag v1.98.0-mcp-utf8.1.
 # Repository guard: runs only when github.repository == 'conradsheeran/litellm'.
-# Dry-run (workflow_dispatch): builds without pushing; push: false forced.
+# Dry-run (workflow_dispatch): builds locally without pushing.
 #
 # See docs/specs/2026-08-26-mcp-routing-utf8-hotfix-v1.98.0.md §8.
 
@@ -12,13 +12,7 @@ on:
   push:
     tags:
       - v1.98.0-mcp-utf8.1
-  workflow_dispatch:
-    inputs:
-      push:
-        description: "Dry-run (build only, no push)"
-        required: true
-        default: false
-        type: boolean
+  workflow_dispatch:  # build-only dry run; never publishes
 
 permissions:
   contents: read
@@ -178,7 +172,7 @@ jobs:
           context: .
           file: docker/Dockerfile.database
           platforms: linux/amd64
-          push: ${{ inputs.push != false }}
+          push: ${{ github.event_name == 'push' }}
           provenance: true
           sbom: true
           tags: ${{ env.TARGET_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
@@ -190,6 +184,7 @@ jobs:
             org.opencontainers.image.description=LiteLLM v1.98.0 database image with MCP routing UTF-8 hotfix
 
       - name: Verify published OCI index
+        if: github.event_name == 'push'
         run: |
           index=$(skopeo inspect --raw "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}")
           manifest_count=$(echo "$index" | python3 -c "import sys,json; m=json.load(sys.stdin); print(len(m.get('manifests',[])))")
@@ -199,6 +194,7 @@ jobs:
           fi
           echo "OCI index contains ${manifest_count} manifests"
       - name: Verify linux/amd64 manifest
+        if: github.event_name == 'push'
         run: |
           # Single-platform build: the tag may point at a manifest directly,
           # or at an index holding one manifest. Resolve to the amd64 digest.
@@ -212,6 +208,7 @@ jobs:
           echo "amd64_digest=${amd64_digest}" >> "$GITHUB_ENV"
 
       - name: Verify linux/amd64 image imports MCP server and pattern counts
+        if: github.event_name == 'push'
         run: |
           # Pull the amd64 child into the local docker daemon and inspect the
           # installed source: the MCP server module must import and the two
@@ -226,6 +223,7 @@ jobs:
             "import pathlib, litellm; p = pathlib.Path(litellm.__file__).parent / 'proxy/_experimental/mcp_server/server.py'; t = p.read_text(); old = t.count('except (json.JSONDecodeError, TypeError)'); patched = t.count('except (json.JSONDecodeError, UnicodeDecodeError, TypeError)'); assert old == 0, f'old pattern count {old}'; assert patched == 2, f'patched pattern count {patched}'; print(f'pattern counts: old={old} patched={patched}')"
 
       - name: Report top-level digest
+        if: github.event_name == 'push'
         run: |
           index_digest=$(skopeo digest "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}")
           echo "## Published image" >> "$GITHUB_STEP_SUMMARY"
@@ -245,6 +243,7 @@ jobs:
 
 
       - name: Verify no extra tags were published
+        if: github.event_name == 'push'
         run: |
           tags=$(skopeo list-tags "docker://${TARGET_REGISTRY}/${IMAGE_NAME}" 2>/dev/null | \
             python3 -c "import sys,json; tags=json.load(sys.stdin).get('RepositoryTags',[]); print(' '.join(tags))" 2>/dev/null || true)
