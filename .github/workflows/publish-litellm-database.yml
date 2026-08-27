@@ -225,7 +225,7 @@ jobs:
       - name: Report top-level digest
         if: github.event_name == 'push'
         run: |
-          index_digest=$(skopeo digest "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}")
+          index_digest=$(skopeo inspect --format '{{.Digest}}' "docker://${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}")
           echo "## Published image" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "\`${TARGET_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}@${index_digest}\`" >> "$GITHUB_STEP_SUMMARY"
